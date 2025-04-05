@@ -1850,8 +1850,7 @@ pub const BundleV2 = struct {
         event_loop: *bun.JSC.EventLoop,
         _: std.mem.Allocator,
     ) OOM!*JSBundleCompletionTask {
-        const completion = bun.new(JSBundleCompletionTask, .{
-            .ref_count = .init(),
+        const completion = JSBundleCompletionTask.new(.{
             .config = config,
             .jsc_event_loop = event_loop,
             .globalThis = globalThis,
@@ -1918,11 +1917,6 @@ pub const BundleV2 = struct {
     };
 
     pub const JSBundleCompletionTask = struct {
-        pub const RefCount = bun.ptr.ThreadSafeRefCount(@This(), "ref_count", @This().deinit, .{});
-        // pub const ref = RefCount.ref;
-        pub const deref = RefCount.deref;
-
-        ref_count: RefCount,
         config: bun.JSC.API.JSBundler.Config,
         jsc_event_loop: *bun.JSC.EventLoop,
         task: bun.JSC.AnyTask,
@@ -1940,7 +1934,10 @@ pub const BundleV2 = struct {
         next: ?*JSBundleCompletionTask = null,
         transpiler: *BundleV2 = undefined,
         plugins: ?*bun.JSC.API.JSBundler.Plugin = null,
+        ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
         started_at_ns: u64 = 0,
+
+        pub usingnamespace bun.NewThreadSafeRefCounted(JSBundleCompletionTask, _deinit, null);
 
         pub fn configureBundler(
             completion: *JSBundleCompletionTask,
@@ -2021,7 +2018,7 @@ pub const BundleV2 = struct {
 
         pub const TaskCompletion = bun.JSC.AnyTask.New(JSBundleCompletionTask, onComplete);
 
-        fn deinit(this: *JSBundleCompletionTask) void {
+        fn _deinit(this: *JSBundleCompletionTask) void {
             this.result.deinit();
             this.log.deinit();
             this.poll_ref.disable();
@@ -2030,7 +2027,7 @@ pub const BundleV2 = struct {
             }
             this.config.deinit(bun.default_allocator);
             this.promise.deinit();
-            bun.destroy(this);
+            this.destroy();
         }
 
         pub fn onComplete(this: *JSBundleCompletionTask) void {
@@ -3000,7 +2997,14 @@ pub const BundleV2 = struct {
 
             if (ast.target.isBun()) {
                 if (JSC.HardcodedModule.Alias.get(import_record.path.text, .bun)) |replacement| {
-                    import_record.path.text = replacement.path;
+                    // When bundling node builtins, remove the "node:" prefix.
+                    // This supports special use cases where the bundle is put
+                    // into a non-node module resolver that doesn't support
+                    // node's prefix. https://github.com/oven-sh/bun/issues/18545
+                    import_record.path.text = if (replacement.node_builtin and !replacement.node_only_prefix)
+                        replacement.path[5..]
+                    else
+                        replacement.path;
                     import_record.tag = replacement.tag;
                     import_record.source_index = Index.invalid;
                     import_record.is_external_without_side_effects = true;

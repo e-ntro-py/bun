@@ -540,11 +540,7 @@ pub const Listener = struct {
         return this.strong_data.get() orelse JSValue.jsUndefined();
     }
 
-    pub fn setData(
-        this: *Listener,
-        globalObject: *JSC.JSGlobalObject,
-        value: JSC.JSValue,
-    ) callconv(.C) bool {
+    pub fn setData(this: *Listener, globalObject: *JSC.JSGlobalObject, value: JSC.JSValue) callconv(.C) bool {
         log("setData()", .{});
         this.strong_data.set(globalObject, value);
         return true;
@@ -847,15 +843,11 @@ pub const Listener = struct {
         return this_value;
     }
 
-    pub fn onCreateTLS(
-        socket: uws.NewSocketHandler(true),
-    ) void {
+    pub fn onCreateTLS(socket: uws.NewSocketHandler(true)) void {
         onCreate(true, socket);
     }
 
-    pub fn onCreateTCP(
-        socket: uws.NewSocketHandler(false),
-    ) void {
+    pub fn onCreateTCP(socket: uws.NewSocketHandler(false)) void {
         onCreate(false, socket);
     }
 
@@ -868,7 +860,6 @@ pub const Listener = struct {
         bun.assert(ssl == listener.ssl);
 
         var this_socket = Socket.new(.{
-            .ref_count = .init(),
             .handlers = &listener.handlers,
             .this_value = .zero,
             // here we start with a detached socket and attach it later after accept
@@ -894,8 +885,7 @@ pub const Listener = struct {
         const Socket = NewSocket(ssl);
         bun.assert(ssl == listener.ssl);
 
-        const this_socket = bun.new(Socket, .{
-            .ref_count = .init(),
+        var this_socket = Socket.new(.{
             .handlers = &listener.handlers,
             .this_value = .zero,
             .socket = socket,
@@ -1146,7 +1136,6 @@ pub const Listener = struct {
 
                 if (ssl_enabled) {
                     var tls = TLSSocket.new(.{
-                        .ref_count = .init(),
                         .handlers = handlers_ptr,
                         .this_value = .zero,
                         .socket = TLSSocket.Socket.detached,
@@ -1172,7 +1161,6 @@ pub const Listener = struct {
                     }
                 } else {
                     var tcp = TCPSocket.new(.{
-                        .ref_count = .init(),
                         .handlers = handlers_ptr,
                         .this_value = .zero,
                         .socket = TCPSocket.Socket.detached,
@@ -1244,8 +1232,7 @@ pub const Listener = struct {
         switch (ssl_enabled) {
             inline else => |is_ssl_enabled| {
                 const SocketType = NewSocket(is_ssl_enabled);
-                const socket = bun.new(SocketType, .{
-                    .ref_count = .init(),
+                var socket = SocketType.new(.{
                     .handlers = handlers_ptr,
                     .this_value = .zero,
                     .socket = SocketType.Socket.detached,
@@ -1267,6 +1254,36 @@ pub const Listener = struct {
                 return promise_value;
             },
         }
+    }
+
+    pub fn getsockname(this: *Listener, globalThis: *JSC.JSGlobalObject, callFrame: *JSC.CallFrame) bun.JSError!JSValue {
+        if (this.listener != .uws) {
+            return .jsUndefined();
+        }
+
+        const out = callFrame.argumentsAsArray(1)[0];
+        const socket = this.listener.uws;
+
+        var buf: [64]u8 = [_]u8{0} ** 64;
+        var text_buf: [512]u8 = undefined;
+        const address_bytes: []const u8 = socket.getLocalAddress(this.ssl, &buf) catch return .jsUndefined();
+        const address_zig: std.net.Address = switch (address_bytes.len) {
+            4 => std.net.Address.initIp4(address_bytes[0..4].*, 0),
+            16 => std.net.Address.initIp6(address_bytes[0..16].*, 0, 0, 0),
+            else => return .jsUndefined(),
+        };
+        const family_js = switch (address_bytes.len) {
+            4 => bun.String.static("IPv4").toJS(globalThis),
+            16 => bun.String.static("IPv6").toJS(globalThis),
+            else => return .jsUndefined(),
+        };
+        const address_js = ZigString.init(bun.fmt.formatIp(address_zig, &text_buf) catch unreachable).toJS(globalThis);
+        const port_js: JSValue = .jsNumber(socket.getLocalPort(this.ssl));
+
+        out.put(globalThis, bun.String.static("family"), family_js);
+        out.put(globalThis, bun.String.static("address"), address_js);
+        out.put(globalThis, bun.String.static("port"), port_js);
+        return .jsUndefined();
     }
 };
 
@@ -1305,19 +1322,13 @@ fn selectALPNCallback(
 
 fn NewSocket(comptime ssl: bool) type {
     return struct {
-        const This = @This();
-        pub const new = bun.TrivialNew(@This());
-        const RefCount = bun.ptr.RefCount(@This(), "ref_count", deinit, .{});
-        pub const ref = RefCount.ref;
-        pub const deref = RefCount.deref;
-
         pub const Socket = uws.NewSocketHandler(ssl);
         socket: Socket,
         // if the socket owns a context it will be here
         socket_context: ?*uws.SocketContext,
 
         flags: Flags = .{},
-        ref_count: RefCount,
+        ref_count: u32 = 1,
         wrapped: WrappedType = .none,
         handlers: *Handlers,
         this_value: JSC.JSValue = .zero,
@@ -1333,6 +1344,7 @@ fn NewSocket(comptime ssl: bool) type {
         // This is wasteful because it means we are keeping a JSC::Weak for every single open socket
         has_pending_activity: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
         native_callback: NativeCallbacks = .none,
+        pub usingnamespace bun.NewRefCounted(@This(), deinit, "Socket");
 
         // We use this direct callbacks on HTTP2 when available
         pub const NativeCallbacks = union(enum) {
@@ -1359,6 +1371,7 @@ fn NewSocket(comptime ssl: bool) type {
             }
         };
 
+        const This = @This();
         const log = Output.scoped(.Socket, false);
         const WriteResult = union(enum) {
             fail: void,
@@ -2097,10 +2110,40 @@ fn NewSocket(comptime ssl: bool) type {
             };
         }
 
-        pub fn getLocalPort(
-            this: *This,
-            _: *JSC.JSGlobalObject,
-        ) JSValue {
+        pub fn getLocalFamily(this: *This, globalThis: *JSC.JSGlobalObject) JSValue {
+            if (this.socket.isDetached()) {
+                return JSValue.jsUndefined();
+            }
+
+            var buf: [64]u8 = [_]u8{0} ** 64;
+            const address_bytes: []const u8 = this.socket.localAddress(&buf) orelse return JSValue.jsUndefined();
+            return switch (address_bytes.len) {
+                4 => bun.String.static("IPv4").toJS(globalThis),
+                16 => bun.String.static("IPv6").toJS(globalThis),
+                else => return JSValue.jsUndefined(),
+            };
+        }
+
+        pub fn getLocalAddress(this: *This, globalThis: *JSC.JSGlobalObject) JSValue {
+            if (this.socket.isDetached()) {
+                return JSValue.jsUndefined();
+            }
+
+            var buf: [64]u8 = [_]u8{0} ** 64;
+            var text_buf: [512]u8 = undefined;
+
+            const address_bytes: []const u8 = this.socket.localAddress(&buf) orelse return JSValue.jsUndefined();
+            const address: std.net.Address = switch (address_bytes.len) {
+                4 => std.net.Address.initIp4(address_bytes[0..4].*, 0),
+                16 => std.net.Address.initIp6(address_bytes[0..16].*, 0, 0, 0),
+                else => return JSValue.jsUndefined(),
+            };
+
+            const text = bun.fmt.formatIp(address, &text_buf) catch unreachable;
+            return ZigString.init(text).toJS(globalThis);
+        }
+
+        pub fn getLocalPort(this: *This, _: *JSC.JSGlobalObject) JSValue {
             if (this.socket.isDetached()) {
                 return JSValue.jsUndefined();
             }
@@ -2108,10 +2151,21 @@ fn NewSocket(comptime ssl: bool) type {
             return JSValue.jsNumber(this.socket.localPort());
         }
 
-        pub fn getRemoteAddress(
-            this: *This,
-            globalThis: *JSC.JSGlobalObject,
-        ) JSValue {
+        pub fn getRemoteFamily(this: *This, globalThis: *JSC.JSGlobalObject) JSValue {
+            if (this.socket.isDetached()) {
+                return JSValue.jsUndefined();
+            }
+
+            var buf: [64]u8 = [_]u8{0} ** 64;
+            const address_bytes: []const u8 = this.socket.remoteAddress(&buf) orelse return JSValue.jsUndefined();
+            return switch (address_bytes.len) {
+                4 => bun.String.static("IPv4").toJS(globalThis),
+                16 => bun.String.static("IPv6").toJS(globalThis),
+                else => return JSValue.jsUndefined(),
+            };
+        }
+
+        pub fn getRemoteAddress(this: *This, globalThis: *JSC.JSGlobalObject) JSValue {
             if (this.socket.isDetached()) {
                 return JSValue.jsUndefined();
             }
@@ -2128,6 +2182,14 @@ fn NewSocket(comptime ssl: bool) type {
 
             const text = bun.fmt.formatIp(address, &text_buf) catch unreachable;
             return ZigString.init(text).toJS(globalThis);
+        }
+
+        pub fn getRemotePort(this: *This, _: *JSC.JSGlobalObject) JSValue {
+            if (this.socket.isDetached()) {
+                return JSValue.jsUndefined();
+            }
+
+            return JSValue.jsNumber(this.socket.remotePort());
         }
 
         pub fn writeMaybeCorked(this: *This, buffer: []const u8) i32 {
@@ -2595,7 +2657,7 @@ fn NewSocket(comptime ssl: bool) type {
                 this.socket_context = null;
                 socket_context.deinit(ssl);
             }
-            bun.destroy(this);
+            this.destroy();
         }
 
         pub fn finalize(this: *This) void {
@@ -3462,8 +3524,7 @@ fn NewSocket(comptime ssl: bool) type {
             handlers_ptr.* = handlers;
             handlers_ptr.is_server = is_server;
             handlers_ptr.protect();
-            var tls = bun.new(TLSSocket, .{
-                .ref_count = .init(),
+            var tls = TLSSocket.new(.{
                 .handlers = handlers_ptr,
                 .this_value = .zero,
                 .socket = TLSSocket.Socket.detached,
@@ -3562,8 +3623,7 @@ fn NewSocket(comptime ssl: bool) type {
 
             raw_handlers_ptr.protect();
 
-            const raw = bun.new(TLSSocket, .{
-                .ref_count = .init(),
+            var raw = TLSSocket.new(.{
                 .handlers = raw_handlers_ptr,
                 .this_value = .zero,
                 .socket = new_socket,
@@ -3598,7 +3658,7 @@ fn NewSocket(comptime ssl: bool) type {
                 this.poll_ref.disable();
                 this.flags.is_active = false;
                 // will free handlers when hits 0 active connections
-                // the connection can be upgraded inside a handler call so we need to guarantee that it will be still alive
+                // the connection can be upgraded inside a handler call so we need to garantee that it will be still alive
                 this.handlers.markInactive();
 
                 this.has_pending_activity.store(false, .release);
@@ -3755,7 +3815,7 @@ pub const DuplexUpgradeContext = struct {
         Close,
     };
 
-    pub const new = bun.TrivialNew(DuplexUpgradeContext);
+    usingnamespace bun.New(DuplexUpgradeContext);
 
     fn onOpen(this: *DuplexUpgradeContext) void {
         this.is_open = true;
@@ -3883,7 +3943,7 @@ pub const WindowsNamedPipeListeningContext = if (Environment.isWindows) struct {
     globalThis: *JSC.JSGlobalObject,
     vm: *JSC.VirtualMachine,
     ctx: ?*BoringSSL.SSL_CTX = null, // server reuses the same ctx
-    pub const new = bun.TrivialNew(WindowsNamedPipeListeningContext);
+    usingnamespace bun.New(WindowsNamedPipeListeningContext);
 
     fn onClientConnect(this: *WindowsNamedPipeListeningContext, status: uv.ReturnCode) void {
         if (status != uv.ReturnCode.zero or this.vm.isShuttingDown() or this.listener == null) {
@@ -3983,7 +4043,7 @@ pub const WindowsNamedPipeListeningContext = if (Environment.isWindows) struct {
             this.ctx = null;
             BoringSSL.SSL_CTX_free(ctx);
         }
-        bun.destroy(this);
+        this.destroy();
     }
 } else void;
 pub const WindowsNamedPipeContext = if (Environment.isWindows) struct {
@@ -4007,7 +4067,7 @@ pub const WindowsNamedPipeContext = if (Environment.isWindows) struct {
         none: void,
     };
 
-    pub const new = bun.TrivialNew(WindowsNamedPipeContext);
+    usingnamespace bun.New(WindowsNamedPipeContext);
     const log = Output.scoped(.WindowsNamedPipeContext, false);
 
     fn onOpen(this: *WindowsNamedPipeContext) void {
@@ -4263,7 +4323,7 @@ pub const WindowsNamedPipeContext = if (Environment.isWindows) struct {
         }
 
         this.named_pipe.deinit();
-        bun.destroy(this);
+        this.destroy();
     }
 } else void;
 
@@ -4338,8 +4398,7 @@ pub fn jsUpgradeDuplexToTLS(globalObject: *JSC.JSGlobalObject, callframe: *JSC.C
     handlers_ptr.* = handlers;
     handlers_ptr.is_server = is_server;
     handlers_ptr.protect();
-    var tls = bun.new(TLSSocket, .{
-        .ref_count = .init(),
+    var tls = TLSSocket.new(.{
         .handlers = handlers_ptr,
         .this_value = .zero,
         .socket = TLSSocket.Socket.detached,

@@ -74,6 +74,7 @@ const PackageManager = @import("../install/install.zig").PackageManager;
 const IPC = @import("ipc.zig");
 const DNSResolver = @import("api/bun/dns_resolver.zig").DNSResolver;
 const Watcher = bun.Watcher;
+const node_module_module = @import("./bindings/NodeModuleModule.zig");
 
 const ModuleLoader = JSC.ModuleLoader;
 const FetchFlags = JSC.FetchFlags;
@@ -320,7 +321,7 @@ pub const SavedSourceMap = struct {
                 defer this.unlock();
                 var saved = SavedMappings{ .data = @as([*]u8, @ptrCast(Value.from(mapping.value_ptr.*).as(ParsedSourceMap))) };
                 defer saved.deinit();
-                const result = bun.new(ParsedSourceMap, saved.toMapping(default_allocator, path) catch {
+                const result = ParsedSourceMap.new(saved.toMapping(default_allocator, path) catch {
                     _ = this.map.remove(mapping.key_ptr.*);
                     return .{};
                 });
@@ -900,7 +901,7 @@ pub const VirtualMachine = struct {
 
     is_inside_deferred_task_queue: bool = false,
 
-    // defaults off. .on("message") will set it to true unles overridden
+    // defaults off. .on("message") will set it to true unless overridden
     // process.channel.unref() will set it to false and mark it overridden
     // on disconnect it will be disabled
     channel_ref: bun.Async.KeepAlive = .{},
@@ -908,6 +909,18 @@ pub const VirtualMachine = struct {
     channel_ref_overridden: bool = false,
     // if one disconnect event listener should be ignored
     channel_ref_should_ignore_one_disconnect_event_listener: bool = false,
+
+    /// A set of extensions that exist in the require.extensions map. Keys
+    /// contain the leading '.'. Value is either a loader for built in
+    /// functions, or an index into JSCommonJSExtensions.
+    ///
+    /// `.keys() == transpiler.resolver.opts.extra_cjs_extensions`, so
+    /// mutations in this map must update the resolver.
+    commonjs_custom_extensions: bun.StringArrayHashMapUnmanaged(node_module_module.CustomLoader.Packed) = .empty,
+    /// Incremented when the `require.extensions` for a built-in extension is mutated.
+    /// An example is mutating `require.extensions['.js']` to intercept all '.js' files.
+    /// The value is decremented when defaults are restored.
+    has_mutated_built_in_extensions: u32 = 0,
 
     pub const OnUnhandledRejection = fn (*VirtualMachine, globalObject: *JSGlobalObject, JSValue) void;
 
@@ -1175,6 +1188,11 @@ pub const VirtualMachine = struct {
             } else |_| {
                 Output.warn("Failed to parse IPC channel number '{s}'", .{fd_s});
             }
+        }
+
+        // Node.js checks if this are set to "1" and no other value
+        if (map.get("NODE_PRESERVE_SYMLINKS")) |value| {
+            this.transpiler.resolver.opts.preserve_symlinks = bun.strings.eqlComptime(value, "1");
         }
 
         if (map.get("BUN_GARBAGE_COLLECTOR_LEVEL")) |gc_level| {
@@ -2077,6 +2095,7 @@ pub const VirtualMachine = struct {
         vm.transpiler.macro_context = null;
         vm.transpiler.resolver.store_fd = opts.store_fd;
         vm.transpiler.resolver.prefer_module_field = false;
+        vm.transpiler.resolver.opts.preserve_symlinks = opts.args.preserve_symlinks orelse false;
 
         vm.transpiler.resolver.onWakePackageManager = .{
             .context = &vm.modules,
@@ -2367,7 +2386,6 @@ pub const VirtualMachine = struct {
                 .source_code = bun.String.init(""),
                 .specifier = specifier,
                 .source_url = specifier.createIfDifferent(source_url),
-                .hash = 0,
                 .allocator = null,
                 .source_code_needs_deref = false,
             };
@@ -2382,7 +2400,6 @@ pub const VirtualMachine = struct {
             .source_code = bun.String.init(source.impl),
             .specifier = specifier,
             .source_url = specifier.createIfDifferent(source_url),
-            .hash = source.hash,
             .allocator = source,
             .source_code_needs_deref = false,
         };
@@ -4413,13 +4430,12 @@ pub const VirtualMachine = struct {
     };
 
     pub const IPCInstance = struct {
-        pub const new = bun.TrivialNew(@This());
-        pub const deinit = bun.TrivialDeinit(@This());
-
         globalThis: ?*JSGlobalObject,
         context: if (Environment.isPosix) *uws.SocketContext else void,
         data: IPC.IPCData,
         has_disconnect_called: bool = false,
+
+        pub usingnamespace bun.New(@This());
 
         const node_cluster_binding = @import("./node/node_cluster_binding.zig");
 
@@ -4469,7 +4485,7 @@ pub const VirtualMachine = struct {
                 uws.us_socket_context_free(0, this.context);
             }
             vm.channel_ref.disable();
-            this.deinit();
+            this.destroy();
         }
 
         export fn Bun__closeChildIPC(global: *JSGlobalObject) void {
@@ -4510,7 +4526,7 @@ pub const VirtualMachine = struct {
                 this.ipc = .{ .initialized = instance };
 
                 const socket = IPC.Socket.fromFd(context, opts.info, IPCInstance, instance, null) orelse {
-                    instance.deinit();
+                    instance.destroy();
                     this.ipc = null;
                     Output.warn("Unable to start IPC socket", .{});
                     return null;
@@ -4531,7 +4547,7 @@ pub const VirtualMachine = struct {
                 this.ipc = .{ .initialized = instance };
 
                 instance.data.configureClient(IPCInstance, instance, opts.info) catch {
-                    instance.deinit();
+                    instance.destroy();
                     this.ipc = null;
                     Output.warn("Unable to start IPC pipe '{}'", .{opts.info});
                     return null;
